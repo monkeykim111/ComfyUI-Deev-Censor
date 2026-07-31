@@ -49,6 +49,22 @@ accept more weak detections and can increase false positives. The node bounds
 the setting to `0.01` through `0.15`; the upper bound is the previous production
 threshold, so a workflow cannot configure a looser policy than before.
 
+`enable_tiled_retry` defaults to off. When enabled, a full-image anus miss runs
+up to four overlapping crop inferences at the same model input size. This makes
+small rear-view targets larger to the detector. Only tile-level `anus`
+detections at confidence `0.10` or higher are accepted; this stricter,
+class-specific fallback avoids the large number of penis/vagina false positives
+observed when tiled crops were evaluated at `0.05`. Tile detections are mapped
+back by rendering through each crop's own letterbox and segmentation prototype.
+Overlapping results are composed conservatively; multiple or crop-edge
+detections use mosaic instead of a white segmentation fill.
+
+The retry only runs when the full-image pass detects zero anus instances. A
+zero result after all retry views is logged, but an IMAGE-only node cannot tell
+whether an otherwise safe image truly contains no anus or the detector missed
+one. A strict adult pipeline still needs a separate reject/regenerate policy if
+zero-after-retry must be blocked.
+
 ## Pinned model
 
 - Source: `01miku/anime-nsfw-segm-yolo26`

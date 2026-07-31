@@ -65,6 +65,10 @@ BOX_EXPANSION_RATIO_PER_SIDE = 0.20
 BOX_EXPANSION_MINIMUM_PIXELS = 8
 MOSAIC_SHORT_SIDE_CELLS = 10
 
+TILED_RETRY_OVERLAP_RATIO = 0.20
+TILED_RETRY_CONFIDENCE = 0.10
+TILED_RETRY_CLASS_IDS = frozenset((0,))
+
 _EXPECTED_METADATA = {
     "author": "Ultralytics",
     "batch": "1",
@@ -108,6 +112,20 @@ class _Runtime:
     prediction_output_name: str
     prototype_output_name: str
     model_signature: tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _InferenceResult:
+    detections: list[_Detection]
+    face_count: int
+    prototype: np.ndarray
+    letterbox: _Letterbox
+
+
+@dataclass(frozen=True)
+class _TileInferenceResult:
+    bounds: tuple[int, int, int, int]
+    inference: _InferenceResult
 
 
 _runtime_lock = threading.Lock()
@@ -725,21 +743,11 @@ def _apply_policy(
     return output
 
 
-def _censor_numpy_image(
+def _run_inference(
     image: np.ndarray,
     runtime: _Runtime,
     detection_confidence: float = DETECTION_CONFIDENCE,
-) -> np.ndarray:
-    if (
-        image.ndim != 3
-        or image.shape[2] < 3
-        or not np.issubdtype(image.dtype, np.floating)
-        or not np.isfinite(image).all()
-    ):
-        raise DeevCensorError("ComfyUI IMAGE input is invalid")
-    if np.any(image < 0) or np.any(image > 1):
-        raise DeevCensorError("ComfyUI IMAGE values must be within [0, 1]")
-
+) -> _InferenceResult:
     model_input, letterbox = _letterbox(
         np.asarray(image[:, :, :3], dtype=np.float32),
     )
@@ -764,13 +772,232 @@ def _censor_numpy_image(
         prediction,
         detection_confidence,
     )
-    return _apply_policy(
-        image,
-        detections,
-        face_count,
-        prototype,
+    return _InferenceResult(
+        detections=detections,
+        face_count=face_count,
+        prototype=prototype,
+        letterbox=letterbox,
+    )
+
+
+def _axis_tile_ranges(length: int) -> tuple[tuple[int, int], ...]:
+    if length <= 0:
+        raise DeevCensorError("cannot tile an empty image axis")
+    window = min(
+        length,
+        max(
+            1,
+            int(np.ceil(length / (2 - TILED_RETRY_OVERLAP_RATIO))),
+        ),
+    )
+    starts = sorted({0, length - window})
+    return tuple((start, start + window) for start in starts)
+
+
+def _tile_bounds(width: int, height: int) -> tuple[tuple[int, int, int, int], ...]:
+    horizontal = _axis_tile_ranges(width)
+    vertical = _axis_tile_ranges(height)
+    return tuple(
+        (left, top, right, bottom)
+        for top, bottom in vertical
+        for left, right in horizontal
+    )
+
+
+def _detection_touches_tile_edge(
+    detection: _Detection,
+    letterbox: _Letterbox,
+) -> bool:
+    expanded = _expanded_box(
+        _restore_box(detection.box_xyxy, letterbox),
+        letterbox.source_width,
+        letterbox.source_height,
+    )
+    return (
+        expanded[0] == 0
+        or expanded[1] == 0
+        or expanded[2] == letterbox.source_width
+        or expanded[3] == letterbox.source_height
+    )
+
+
+def _global_source_box(
+    detection: _Detection,
+    letterbox: _Letterbox,
+    tile_bounds: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    tile_left, tile_top, tile_right, tile_bottom = tile_bounds
+    if (
+        tile_right - tile_left != letterbox.source_width
+        or tile_bottom - tile_top != letterbox.source_height
+    ):
+        raise DeevCensorError("tile bounds do not match inference source")
+    left, top, right, bottom = _restore_box(
+        detection.box_xyxy,
         letterbox,
     )
+    return (
+        left + tile_left,
+        top + tile_top,
+        right + tile_left,
+        bottom + tile_top,
+    )
+
+
+def _apply_tiled_retry(
+    image: np.ndarray,
+    tile_results: Sequence[_TileInferenceResult],
+) -> np.ndarray:
+    output = image.copy()
+    target_count = sum(
+        len(result.inference.detections)
+        for result in tile_results
+    )
+    if target_count == 0:
+        return output
+
+    aggregate_face_count = sum(
+        result.inference.face_count
+        for result in tile_results
+    )
+    force_mosaic_for_multiple = target_count != 1
+
+    # Render only after every tile inference succeeds. Each tile uses its own
+    # prototype and letterbox; passing the current output slice also prevents
+    # a later overlapping tile from restoring pixels censored by an earlier one.
+    for result in tile_results:
+        inference = result.inference
+        if not inference.detections:
+            continue
+        left, top, right, bottom = result.bounds
+        policy_face_count = aggregate_face_count
+        edge_detections = [
+            detection
+            for detection in inference.detections
+            if _detection_touches_tile_edge(
+                detection,
+                inference.letterbox,
+            )
+        ]
+        if (
+            force_mosaic_for_multiple
+            or edge_detections
+        ):
+            policy_face_count = max(2, policy_face_count)
+        output[top:bottom, left:right] = _apply_policy(
+            output[top:bottom, left:right],
+            inference.detections,
+            policy_face_count,
+            inference.prototype,
+            inference.letterbox,
+        )
+        # A tile-local expanded box clips at the crop boundary. Repeat edge
+        # mosaics in global source coordinates so the covered region extends
+        # into the neighbouring tile instead of leaving a visible strip.
+        for detection in edge_detections:
+            _mosaic(
+                output,
+                _expanded_box(
+                    _global_source_box(
+                        detection,
+                        inference.letterbox,
+                        result.bounds,
+                    ),
+                    image.shape[1],
+                    image.shape[0],
+                ),
+            )
+    return output
+
+
+def _filter_tiled_retry_detections(
+    inference: _InferenceResult,
+) -> _InferenceResult:
+    return _InferenceResult(
+        detections=[
+            detection
+            for detection in inference.detections
+            if detection.class_id in TILED_RETRY_CLASS_IDS
+        ],
+        face_count=inference.face_count,
+        prototype=inference.prototype,
+        letterbox=inference.letterbox,
+    )
+
+
+def _censor_numpy_image(
+    image: np.ndarray,
+    runtime: _Runtime,
+    detection_confidence: float = DETECTION_CONFIDENCE,
+    enable_tiled_retry: bool = False,
+) -> np.ndarray:
+    if (
+        image.ndim != 3
+        or image.shape[2] < 3
+        or not np.issubdtype(image.dtype, np.floating)
+        or not np.isfinite(image).all()
+    ):
+        raise DeevCensorError("ComfyUI IMAGE input is invalid")
+    if np.any(image < 0) or np.any(image > 1):
+        raise DeevCensorError("ComfyUI IMAGE values must be within [0, 1]")
+
+    full = _run_inference(
+        image,
+        runtime,
+        detection_confidence,
+    )
+    output = _apply_policy(
+        image,
+        full.detections,
+        full.face_count,
+        full.prototype,
+        full.letterbox,
+    )
+    full_retry_class_count = sum(
+        detection.class_id in TILED_RETRY_CLASS_IDS
+        for detection in full.detections
+    )
+    if not enable_tiled_retry or full_retry_class_count > 0:
+        return output
+
+    bounds = _tile_bounds(image.shape[1], image.shape[0])
+    tile_confidence = max(
+        detection_confidence,
+        TILED_RETRY_CONFIDENCE,
+    )
+    print(
+        "[Deev Censor] full-image anus detection count is zero; "
+        f"running {len(bounds)} overlapping tiled retry views "
+        f"at confidence {tile_confidence:.2f}",
+    )
+    tile_results = [
+        _TileInferenceResult(
+            bounds=(left, top, right, bottom),
+            inference=_filter_tiled_retry_detections(
+                _run_inference(
+                    image[top:bottom, left:right],
+                    runtime,
+                    tile_confidence,
+                ),
+            ),
+        )
+        for left, top, right, bottom in bounds
+    ]
+    target_count = sum(
+        len(result.inference.detections)
+        for result in tile_results
+    )
+    if target_count == 0:
+        print(
+            "[Deev Censor] WARNING: no anus detection after "
+            "full-image and tiled retry passes",
+        )
+    else:
+        print(
+            "[Deev Censor] tiled retry anus detection count: "
+            f"{target_count}; applying censorship",
+        )
+    return _apply_tiled_retry(output, tile_results)
 
 
 class DeevGenitalAnusCensor:
@@ -792,6 +1019,14 @@ class DeevGenitalAnusCensor:
                         "step": 0.01,
                     },
                 ),
+                "enable_tiled_retry": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "label_on": "enabled",
+                        "label_off": "disabled",
+                    },
+                ),
             },
         }
 
@@ -804,6 +1039,7 @@ class DeevGenitalAnusCensor:
         self,
         images: torch.Tensor,
         detection_confidence: float = DETECTION_CONFIDENCE,
+        enable_tiled_retry: bool = False,
     ) -> tuple[torch.Tensor]:
         if (
             not isinstance(images, torch.Tensor)
@@ -838,6 +1074,7 @@ class DeevGenitalAnusCensor:
                 image,
                 runtime,
                 detection_confidence,
+                bool(enable_tiled_retry),
             )
             for image in source
         ]
