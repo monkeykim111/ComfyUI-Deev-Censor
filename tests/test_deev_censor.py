@@ -207,7 +207,7 @@ class DeevCensorUnitTests(unittest.TestCase):
         )
         np.testing.assert_array_equal(result[0, 0], image[0, 0])
 
-    def test_multiple_stable_targets_each_use_white(self):
+    def test_multiple_stable_targets_each_use_white_with_multiple_faces(self):
         image = gradient_image()
         first_mask = np.zeros((256, 256), dtype=bool)
         first_mask[40:70, 40:70] = True
@@ -235,7 +235,7 @@ class DeevCensorUnitTests(unittest.TestCase):
             result = censor._apply_policy(
                 image,
                 detections,
-                1,
+                2,
                 np.zeros((32, 32, 32), dtype=np.float32),
                 policy_letterbox(),
             )

@@ -704,7 +704,7 @@ def _mosaic(
 def _apply_policy(
     image: np.ndarray,
     detections: list[_Detection],
-    face_count: int,
+    _face_count: int,
     prototype: np.ndarray,
     letterbox: _Letterbox,
     force_mosaic: bool = False,
@@ -722,10 +722,11 @@ def _apply_policy(
         for detection in detections
     ]
 
+    # Face detections are not used as a global gate: duplicate or partner
+    # faces do not make an individual high-confidence contour ambiguous.
     stable = [
         (
             not force_mosaic
-            and face_count <= 1
             and detection.confidence >= STABLE_MASK_CONFIDENCE
             and _is_stable_mask(mask, source_box)
         )
