@@ -44,6 +44,11 @@ Deev Genital/Anus Censor (01miku)
 
 Input and output are standard ComfyUI `IMAGE` batches.
 
+`detection_confidence` defaults to the conservative value `0.05`. Lower values
+accept more weak detections and can increase false positives. The node bounds
+the setting to `0.01` through `0.15`; the upper bound is the previous production
+threshold, so a workflow cannot configure a looser policy than before.
+
 ## Pinned model
 
 - Source: `01miku/anime-nsfw-segm-yolo26`

@@ -1,8 +1,8 @@
 """Fail-closed genital/anus censorship for Deev ComfyUI workflows.
 
-The node intentionally exposes no policy widgets. The model identity, target
-classes, thresholds, and rendering policy are production invariants rather
-than workflow author choices.
+The model identity, target classes, and rendering policy are production
+invariants. Detection confidence can be tightened within a bounded
+safety-oriented range for validated Deev workflows.
 """
 
 from __future__ import annotations
@@ -52,7 +52,9 @@ FACE_CLASS_IDS = frozenset((4, 5))
 
 MODEL_IMAGE_SIZE = 1280
 MODEL_MASK_DIMENSIONS = 32
-DETECTION_CONFIDENCE = 0.15
+DETECTION_CONFIDENCE = 0.05
+MIN_DETECTION_CONFIDENCE = 0.01
+MAX_DETECTION_CONFIDENCE = 0.15
 STABLE_MASK_CONFIDENCE = 0.35
 NMS_IOU_THRESHOLD = 0.70
 MAX_DETECTIONS = 100
@@ -464,6 +466,7 @@ def _nms(detections: Iterable[_Detection]) -> list[_Detection]:
 
 def _detections(
     prediction: np.ndarray,
+    detection_confidence: float = DETECTION_CONFIDENCE,
 ) -> tuple[list[_Detection], int]:
     boxes = _xywh_to_xyxy(prediction[:, :4])
     class_scores = prediction[:, 4 : 4 + len(EXPECTED_CLASS_NAMES)]
@@ -476,7 +479,7 @@ def _detections(
 
     candidates: list[_Detection] = []
     face_candidates: list[_Detection] = []
-    for index in np.flatnonzero(confidences >= DETECTION_CONFIDENCE):
+    for index in np.flatnonzero(confidences >= detection_confidence):
         class_id = int(class_ids[index])
         if class_id not in TARGET_CLASS_IDS and class_id not in FACE_CLASS_IDS:
             # In particular, class 1 (nipple) never affects censoring policy.
@@ -722,7 +725,11 @@ def _apply_policy(
     return output
 
 
-def _censor_numpy_image(image: np.ndarray, runtime: _Runtime) -> np.ndarray:
+def _censor_numpy_image(
+    image: np.ndarray,
+    runtime: _Runtime,
+    detection_confidence: float = DETECTION_CONFIDENCE,
+) -> np.ndarray:
     if (
         image.ndim != 3
         or image.shape[2] < 3
@@ -753,7 +760,10 @@ def _censor_numpy_image(image: np.ndarray, runtime: _Runtime) -> np.ndarray:
         raw_outputs[0],
         raw_outputs[1],
     )
-    detections, face_count = _detections(prediction)
+    detections, face_count = _detections(
+        prediction,
+        detection_confidence,
+    )
     return _apply_policy(
         image,
         detections,
@@ -767,10 +777,21 @@ class DeevGenitalAnusCensor:
     """Censor anus/penis/vagina while deliberately leaving nipples untouched."""
 
     @classmethod
-    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[str]]]:
+    def INPUT_TYPES(cls) -> dict[str, dict[str, tuple[Any, ...]]]:
         return {
             "required": {
                 "images": ("IMAGE",),
+            },
+            "optional": {
+                "detection_confidence": (
+                    "FLOAT",
+                    {
+                        "default": DETECTION_CONFIDENCE,
+                        "min": MIN_DETECTION_CONFIDENCE,
+                        "max": MAX_DETECTION_CONFIDENCE,
+                        "step": 0.01,
+                    },
+                ),
             },
         }
 
@@ -779,7 +800,11 @@ class DeevGenitalAnusCensor:
     FUNCTION = "censor"
     CATEGORY = "Toonsquare/Deev"
 
-    def censor(self, images: torch.Tensor) -> tuple[torch.Tensor]:
+    def censor(
+        self,
+        images: torch.Tensor,
+        detection_confidence: float = DETECTION_CONFIDENCE,
+    ) -> tuple[torch.Tensor]:
         if (
             not isinstance(images, torch.Tensor)
             or images.ndim != 4
@@ -787,6 +812,19 @@ class DeevGenitalAnusCensor:
             or images.shape[0] <= 0
         ):
             raise DeevCensorError("expected a non-empty ComfyUI IMAGE batch")
+        try:
+            detection_confidence = float(detection_confidence)
+        except (TypeError, ValueError) as error:
+            raise DeevCensorError("detection confidence must be numeric") from error
+        if (
+            not np.isfinite(detection_confidence)
+            or detection_confidence < MIN_DETECTION_CONFIDENCE
+            or detection_confidence > MAX_DETECTION_CONFIDENCE
+        ):
+            raise DeevCensorError(
+                "detection confidence must be between "
+                f"{MIN_DETECTION_CONFIDENCE} and {MAX_DETECTION_CONFIDENCE}",
+            )
 
         runtime = _get_runtime()
         try:
@@ -796,7 +834,11 @@ class DeevGenitalAnusCensor:
 
         # Do not return partial output: every image must be censored successfully.
         processed = [
-            _censor_numpy_image(image, runtime)
+            _censor_numpy_image(
+                image,
+                runtime,
+                detection_confidence,
+            )
             for image in source
         ]
         try:

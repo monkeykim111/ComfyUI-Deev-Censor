@@ -108,6 +108,38 @@ class DeevCensorUnitTests(unittest.TestCase):
             np.count_nonzero(np.all(image == 1, axis=2)),
         )
 
+    def test_configurable_lower_threshold_accepts_weak_target(self):
+        gradient = np.linspace(0, 1, 256, dtype=np.float32)
+        image = np.repeat(gradient[None, :, None], 256, axis=0)
+        image = np.repeat(image, 3, axis=2)
+        prediction, prototype = outputs(class_id=0, confidence=0.08)
+        legacy_result = censor._censor_numpy_image(
+            image,
+            runtime(FakeSession(prediction, prototype)),
+            detection_confidence=0.15,
+        )
+        conservative_result = censor._censor_numpy_image(
+            image,
+            runtime(FakeSession(prediction, prototype)),
+            detection_confidence=0.05,
+        )
+        np.testing.assert_array_equal(legacy_result, image)
+        self.assertFalse(np.array_equal(conservative_result, image))
+
+    def test_node_rejects_detection_confidence_outside_safe_range(self):
+        node = censor.DeevGenitalAnusCensor()
+        with (
+            mock.patch.object(censor, "_get_runtime"),
+            self.assertRaisesRegex(
+                censor.DeevCensorError,
+                "detection confidence must be between",
+            ),
+        ):
+            node.censor(
+                censor.torch.zeros((1, 32, 32, 3), dtype=censor.torch.float32),
+                detection_confidence=0.5,
+            )
+
     def test_inference_error_is_fail_closed(self):
         with self.assertRaisesRegex(censor.DeevCensorError, "inference failed"):
             censor._censor_numpy_image(
