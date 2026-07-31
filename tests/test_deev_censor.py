@@ -91,6 +91,37 @@ def outputs(
     return prediction, prototype
 
 
+def detection(class_id, confidence, source_index=0):
+    return censor._Detection(
+        class_id=class_id,
+        confidence=confidence,
+        box_xyxy=np.array((480, 480, 800, 800), dtype=np.float32),
+        mask_coefficients=np.zeros(
+            censor.MODEL_MASK_DIMENSIONS,
+            dtype=np.float32,
+        ),
+        source_index=source_index,
+    )
+
+
+def policy_letterbox():
+    return censor._Letterbox(
+        scale=5,
+        left=0,
+        top=0,
+        resized_width=1280,
+        resized_height=1280,
+        source_width=256,
+        source_height=256,
+    )
+
+
+def gradient_image():
+    gradient = np.linspace(0.1, 0.9, 256, dtype=np.float32)
+    image = np.repeat(gradient[None, :, None], 256, axis=0)
+    return np.repeat(image, 3, axis=2)
+
+
 class DeevCensorUnitTests(unittest.TestCase):
     def setUp(self):
         self.image = np.full((256, 256, 3), 0.25, dtype=np.float32)
@@ -133,6 +164,210 @@ class DeevCensorUnitTests(unittest.TestCase):
             np.count_nonzero(np.all(result == 1, axis=2)),
             np.count_nonzero(np.all(image == 1, axis=2)),
         )
+
+    def test_strong_and_weak_targets_use_white_and_mosaic_independently(self):
+        image = gradient_image()
+        strong_mask = np.zeros((256, 256), dtype=bool)
+        strong_mask[40:80, 40:80] = True
+        weak_mask = np.zeros((256, 256), dtype=bool)
+        weak_mask[130, 130] = True
+        detections = [
+            detection(3, 0.90, 0),
+            detection(0, 0.06, 1),
+        ]
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                side_effect=[
+                    (30, 30, 90, 90),
+                    (120, 120, 160, 160),
+                ],
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                side_effect=[strong_mask, weak_mask],
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                detections,
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+            )
+
+        self.assertTrue(np.all(result[strong_mask] == 1))
+        self.assertFalse(
+            np.array_equal(
+                result[112:168, 112:168],
+                image[112:168, 112:168],
+            ),
+        )
+        np.testing.assert_array_equal(result[0, 0], image[0, 0])
+
+    def test_multiple_stable_targets_each_use_white(self):
+        image = gradient_image()
+        first_mask = np.zeros((256, 256), dtype=bool)
+        first_mask[40:70, 40:70] = True
+        second_mask = np.zeros((256, 256), dtype=bool)
+        second_mask[170:200, 170:200] = True
+        detections = [
+            detection(3, 0.90, 0),
+            detection(0, 0.80, 1),
+        ]
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                side_effect=[
+                    (30, 30, 80, 80),
+                    (160, 160, 210, 210),
+                ],
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                side_effect=[first_mask, second_mask],
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                detections,
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+            )
+
+        self.assertTrue(np.all(result[first_mask] == 1))
+        self.assertTrue(np.all(result[second_mask] == 1))
+        np.testing.assert_array_equal(result[0, 0], image[0, 0])
+
+    def test_white_is_applied_after_overlapping_weak_mosaic(self):
+        image = gradient_image()
+        strong_mask = np.zeros((256, 256), dtype=bool)
+        strong_mask[100:140, 100:140] = True
+        weak_mask = np.zeros((256, 256), dtype=bool)
+        detections = [
+            detection(3, 0.90, 0),
+            detection(2, 0.06, 1),
+        ]
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                side_effect=[
+                    (90, 90, 150, 150),
+                    (80, 80, 160, 160),
+                ],
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                side_effect=[strong_mask, weak_mask],
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                detections,
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+            )
+
+        self.assertTrue(np.all(result[strong_mask] == 1))
+
+    def test_broad_weak_edge_target_stays_mosaic_after_stable_target(self):
+        image = gradient_image()
+        strong_mask = np.zeros((256, 256), dtype=bool)
+        strong_mask[40:70, 40:70] = True
+        weak_mask = np.zeros((256, 256), dtype=bool)
+        weak_mask[128:256, 0:256] = True
+        detections = [
+            detection(3, 0.90, 0),
+            detection(2, 0.06, 1),
+        ]
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                side_effect=[
+                    (30, 30, 80, 80),
+                    (0, 128, 256, 256),
+                ],
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                side_effect=[strong_mask, weak_mask],
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                detections,
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+            )
+
+        self.assertTrue(np.all(result[strong_mask] == 1))
+        self.assertFalse(np.array_equal(result[128:], image[128:]))
+
+    def test_broad_weak_edge_target_without_stable_target_stays_mosaic(self):
+        image = gradient_image()
+        weak_mask = np.zeros((256, 256), dtype=bool)
+        weak_mask[128:256, 0:256] = True
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                return_value=(0, 128, 256, 256),
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                return_value=weak_mask,
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                [detection(2, 0.06)],
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+            )
+
+        self.assertFalse(np.array_equal(result, image))
+        self.assertEqual(np.count_nonzero(np.all(result == 1, axis=2)), 0)
+
+    def test_force_mosaic_overrides_stable_white_mask(self):
+        image = gradient_image()
+        strong_mask = np.zeros((256, 256), dtype=bool)
+        strong_mask[100:140, 100:140] = True
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                return_value=(90, 90, 150, 150),
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                return_value=strong_mask,
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                [detection(0, 0.90)],
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+                force_mosaic=True,
+            )
+
+        self.assertFalse(np.array_equal(result, image))
+        self.assertEqual(np.count_nonzero(np.all(result == 1, axis=2)), 0)
 
     def test_configurable_lower_threshold_accepts_weak_target(self):
         gradient = np.linspace(0, 1, 256, dtype=np.float32)
@@ -288,6 +523,7 @@ class DeevCensorUnitTests(unittest.TestCase):
             enable_tiled_retry=True,
         )
         self.assertFalse(np.array_equal(result, image))
+        self.assertEqual(session.call_count, 5)
         self.assertEqual(
             np.count_nonzero(np.all(result == 1, axis=2)),
             np.count_nonzero(np.all(image == 1, axis=2)),
@@ -320,6 +556,23 @@ class DeevCensorUnitTests(unittest.TestCase):
             ),
             0,
         )
+        self.assertEqual(
+            np.count_nonzero(np.all(result == 1, axis=2)),
+            np.count_nonzero(np.all(image == 1, axis=2)),
+        )
+
+    def test_single_non_edge_high_confidence_tile_can_use_white(self):
+        miss = outputs()
+        hit = outputs(class_id=0, confidence=0.90)
+        session = FakeSession(responses=[miss, hit, miss, miss, miss])
+        image = gradient_image()
+        result = censor._censor_numpy_image(
+            image,
+            runtime(session),
+            enable_tiled_retry=True,
+        )
+        self.assertEqual(session.call_count, 5)
+        self.assertGreater(np.count_nonzero(np.all(result == 1, axis=2)), 0)
 
     def test_tile_bounds_cover_odd_non_square_image_with_overlap(self):
         bounds = censor._tile_bounds(width=503, height=301)

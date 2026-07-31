@@ -707,6 +707,7 @@ def _apply_policy(
     face_count: int,
     prototype: np.ndarray,
     letterbox: _Letterbox,
+    force_mosaic: bool = False,
 ) -> np.ndarray:
     output = image.copy()
     if not detections:
@@ -721,17 +722,30 @@ def _apply_policy(
         for detection in detections
     ]
 
-    stable = (
-        len(detections) == 1
-        and face_count <= 1
-        and detections[0].confidence >= STABLE_MASK_CONFIDENCE
-        and _is_stable_mask(masks[0], source_boxes[0])
-    )
-    if stable:
-        output[_dilate(masks[0]), :3] = 1.0
-        return output
+    stable = [
+        (
+            not force_mosaic
+            and face_count <= 1
+            and detection.confidence >= STABLE_MASK_CONFIDENCE
+            and _is_stable_mask(mask, source_box)
+        )
+        for detection, source_box, mask in zip(
+            detections,
+            source_boxes,
+            masks,
+            strict=True,
+        )
+    ]
 
-    for source_box in source_boxes:
+    # Ambiguous detections remain fail-closed mosaics, even when a separate
+    # stable target exists. A weak candidate may belong to another person.
+    for source_box, is_stable in zip(
+        source_boxes,
+        stable,
+        strict=True,
+    ):
+        if is_stable:
+            continue
         _mosaic(
             output,
             _expanded_box(
@@ -740,6 +754,13 @@ def _apply_policy(
                 letterbox.source_height,
             ),
         )
+
+    # White masks are applied last so an overlapping ambiguous box cannot
+    # downgrade a high-confidence, stable contour to mosaic.
+    for mask, is_stable in zip(masks, stable, strict=True):
+        if is_stable:
+            output[_dilate(mask), :3] = 1.0
+
     return output
 
 
@@ -870,7 +891,6 @@ def _apply_tiled_retry(
         if not inference.detections:
             continue
         left, top, right, bottom = result.bounds
-        policy_face_count = aggregate_face_count
         edge_detections = [
             detection
             for detection in inference.detections
@@ -879,17 +899,16 @@ def _apply_tiled_retry(
                 inference.letterbox,
             )
         ]
-        if (
-            force_mosaic_for_multiple
-            or edge_detections
-        ):
-            policy_face_count = max(2, policy_face_count)
         output[top:bottom, left:right] = _apply_policy(
             output[top:bottom, left:right],
             inference.detections,
-            policy_face_count,
+            aggregate_face_count,
             inference.prototype,
             inference.letterbox,
+            force_mosaic=(
+                force_mosaic_for_multiple
+                or bool(edge_detections)
+            ),
         )
         # A tile-local expanded box clips at the crop boundary. Repeat edge
         # mosaics in global source coordinates so the covered region extends
