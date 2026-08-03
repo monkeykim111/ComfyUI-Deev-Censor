@@ -1,8 +1,9 @@
-"""Fail-closed genital/anus censorship for Deev ComfyUI workflows.
+"""Genital/anus censorship for Deev ComfyUI workflows.
 
 The model identity, target classes, and rendering policy are production
-invariants. Detection confidence can be tightened within a bounded
-safety-oriented range for validated Deev workflows.
+invariants. Conservative workflows retain a fail-closed mosaic fallback;
+white-only workflows can disable it to avoid weak-detection false positives.
+Detection confidence can be tightened within a bounded safety-oriented range.
 """
 
 from __future__ import annotations
@@ -708,6 +709,7 @@ def _apply_policy(
     prototype: np.ndarray,
     letterbox: _Letterbox,
     force_mosaic: bool = False,
+    enable_mosaic_fallback: bool = True,
 ) -> np.ndarray:
     output = image.copy()
     if not detections:
@@ -726,7 +728,7 @@ def _apply_policy(
     # faces do not make an individual high-confidence contour ambiguous.
     stable = [
         (
-            not force_mosaic
+            (not force_mosaic or not enable_mosaic_fallback)
             and detection.confidence >= STABLE_MASK_CONFIDENCE
             and _is_stable_mask(mask, source_box)
         )
@@ -738,23 +740,25 @@ def _apply_policy(
         )
     ]
 
-    # Ambiguous detections remain fail-closed mosaics, even when a separate
-    # stable target exists. A weak candidate may belong to another person.
-    for source_box, is_stable in zip(
-        source_boxes,
-        stable,
-        strict=True,
-    ):
-        if is_stable:
-            continue
-        _mosaic(
-            output,
-            _expanded_box(
-                source_box,
-                letterbox.source_width,
-                letterbox.source_height,
-            ),
-        )
+    # Conservative workflows can retain fail-closed mosaics for ambiguous
+    # detections. White-only workflows deliberately leave those weak regions
+    # unchanged so detector hallucinations cannot obscure unrelated content.
+    if enable_mosaic_fallback:
+        for source_box, is_stable in zip(
+            source_boxes,
+            stable,
+            strict=True,
+        ):
+            if is_stable:
+                continue
+            _mosaic(
+                output,
+                _expanded_box(
+                    source_box,
+                    letterbox.source_width,
+                    letterbox.source_height,
+                ),
+            )
 
     # White masks are applied last so an overlapping ambiguous box cannot
     # downgrade a high-confidence, stable contour to mosaic.
@@ -869,6 +873,7 @@ def _global_source_box(
 def _apply_tiled_retry(
     image: np.ndarray,
     tile_results: Sequence[_TileInferenceResult],
+    enable_mosaic_fallback: bool = True,
 ) -> np.ndarray:
     output = image.copy()
     target_count = sum(
@@ -910,23 +915,25 @@ def _apply_tiled_retry(
                 force_mosaic_for_multiple
                 or bool(edge_detections)
             ),
+            enable_mosaic_fallback=enable_mosaic_fallback,
         )
         # A tile-local expanded box clips at the crop boundary. Repeat edge
         # mosaics in global source coordinates so the covered region extends
         # into the neighbouring tile instead of leaving a visible strip.
-        for detection in edge_detections:
-            _mosaic(
-                output,
-                _expanded_box(
-                    _global_source_box(
-                        detection,
-                        inference.letterbox,
-                        result.bounds,
+        if enable_mosaic_fallback:
+            for detection in edge_detections:
+                _mosaic(
+                    output,
+                    _expanded_box(
+                        _global_source_box(
+                            detection,
+                            inference.letterbox,
+                            result.bounds,
+                        ),
+                        image.shape[1],
+                        image.shape[0],
                     ),
-                    image.shape[1],
-                    image.shape[0],
-                ),
-            )
+                )
     return output
 
 
@@ -950,6 +957,7 @@ def _censor_numpy_image(
     runtime: _Runtime,
     detection_confidence: float = DETECTION_CONFIDENCE,
     enable_tiled_retry: bool = False,
+    enable_mosaic_fallback: bool = True,
 ) -> np.ndarray:
     if (
         image.ndim != 3
@@ -972,6 +980,7 @@ def _censor_numpy_image(
         full.face_count,
         full.prototype,
         full.letterbox,
+        enable_mosaic_fallback=enable_mosaic_fallback,
     )
     full_retry_class_count = sum(
         detection.class_id in TILED_RETRY_CLASS_IDS
@@ -1017,7 +1026,11 @@ def _censor_numpy_image(
             "[Deev Censor] tiled retry anus detection count: "
             f"{target_count}; applying censorship",
         )
-    return _apply_tiled_retry(output, tile_results)
+    return _apply_tiled_retry(
+        output,
+        tile_results,
+        enable_mosaic_fallback=enable_mosaic_fallback,
+    )
 
 
 class DeevGenitalAnusCensor:
@@ -1047,6 +1060,14 @@ class DeevGenitalAnusCensor:
                         "label_off": "disabled",
                     },
                 ),
+                "enable_mosaic_fallback": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "label_on": "enabled",
+                        "label_off": "white only",
+                    },
+                ),
             },
         }
 
@@ -1060,6 +1081,7 @@ class DeevGenitalAnusCensor:
         images: torch.Tensor,
         detection_confidence: float = DETECTION_CONFIDENCE,
         enable_tiled_retry: bool = False,
+        enable_mosaic_fallback: bool = True,
     ) -> tuple[torch.Tensor]:
         if (
             not isinstance(images, torch.Tensor)
@@ -1095,6 +1117,7 @@ class DeevGenitalAnusCensor:
                 runtime,
                 detection_confidence,
                 bool(enable_tiled_retry),
+                bool(enable_mosaic_fallback),
             )
             for image in source
         ]

@@ -1,7 +1,7 @@
 # ComfyUI Deev Censor
 
-A fail-closed ComfyUI image node for deterministic anime genital and anus
-censorship.
+A ComfyUI image node for deterministic anime genital and anus censorship. Its
+default policy is fail-closed; workflows can opt into white-only rendering.
 
 The node detects only `anus`, `penis`, and `vagina`. Nipple detections are
 intentionally ignored. A stable single segmentation mask is filled white;
@@ -58,6 +58,13 @@ observed when tiled crops were evaluated at `0.05`. Tile detections are mapped
 back by rendering through each crop's own letterbox and segmentation prototype.
 Overlapping results are composed conservatively; multiple or crop-edge
 detections use mosaic instead of a white segmentation fill.
+
+`enable_mosaic_fallback` defaults to on and preserves that conservative policy.
+When disabled, high-confidence stable segmentation masks are still filled
+white, including stable tiled results, while weak or unstable detections leave
+the image unchanged. No pixel mosaic is rendered in this white-only mode. This
+reduces off-target occlusion from weak detector hallucinations, but it can also
+allow a real target through when the detector cannot produce a stable mask.
 
 The retry only runs when the full-image pass detects zero anus instances. A
 zero result after all retry views is logged, but an IMAGE-only node cannot tell

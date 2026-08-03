@@ -165,6 +165,31 @@ class DeevCensorUnitTests(unittest.TestCase):
             np.count_nonzero(np.all(image == 1, axis=2)),
         )
 
+    def test_low_confidence_target_is_unchanged_without_mosaic_fallback(self):
+        image = gradient_image()
+        prediction, prototype = outputs(
+            class_id=2,
+            confidence=censor.DETECTION_CONFIDENCE,
+        )
+        result = censor._censor_numpy_image(
+            image,
+            runtime(FakeSession(prediction, prototype)),
+            enable_mosaic_fallback=False,
+        )
+
+        np.testing.assert_array_equal(result, image)
+
+    def test_stable_target_stays_white_without_mosaic_fallback(self):
+        prediction, prototype = outputs(class_id=3, confidence=0.90)
+        result = censor._censor_numpy_image(
+            self.image,
+            runtime(FakeSession(prediction, prototype)),
+            enable_mosaic_fallback=False,
+        )
+
+        self.assertGreater(np.count_nonzero(np.all(result == 1, axis=2)), 0)
+        np.testing.assert_array_equal(result[0, 0], self.image[0, 0])
+
     def test_strong_and_weak_targets_use_white_and_mosaic_independently(self):
         image = gradient_image()
         strong_mask = np.zeros((256, 256), dtype=bool)
@@ -206,6 +231,46 @@ class DeevCensorUnitTests(unittest.TestCase):
             ),
         )
         np.testing.assert_array_equal(result[0, 0], image[0, 0])
+
+    def test_strong_target_stays_white_and_weak_target_is_unchanged_without_fallback(self):
+        image = gradient_image()
+        strong_mask = np.zeros((256, 256), dtype=bool)
+        strong_mask[40:80, 40:80] = True
+        weak_mask = np.zeros((256, 256), dtype=bool)
+        weak_mask[130, 130] = True
+        detections = [
+            detection(3, 0.90, 0),
+            detection(0, 0.06, 1),
+        ]
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                side_effect=[
+                    (30, 30, 90, 90),
+                    (120, 120, 160, 160),
+                ],
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                side_effect=[strong_mask, weak_mask],
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                detections,
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+                enable_mosaic_fallback=False,
+            )
+
+        self.assertTrue(np.all(result[strong_mask] == 1))
+        np.testing.assert_array_equal(
+            result[112:168, 112:168],
+            image[112:168, 112:168],
+        )
 
     def test_multiple_stable_targets_each_use_white_with_multiple_faces(self):
         image = gradient_image()
@@ -369,6 +434,35 @@ class DeevCensorUnitTests(unittest.TestCase):
         self.assertFalse(np.array_equal(result, image))
         self.assertEqual(np.count_nonzero(np.all(result == 1, axis=2)), 0)
 
+    def test_force_mosaic_does_not_override_white_when_fallback_is_disabled(self):
+        image = gradient_image()
+        strong_mask = np.zeros((256, 256), dtype=bool)
+        strong_mask[100:140, 100:140] = True
+        with (
+            mock.patch.object(
+                censor,
+                "_restore_box",
+                return_value=(90, 90, 150, 150),
+            ),
+            mock.patch.object(
+                censor,
+                "_decode_mask",
+                return_value=strong_mask,
+            ),
+        ):
+            result = censor._apply_policy(
+                image,
+                [detection(0, 0.90)],
+                1,
+                np.zeros((32, 32, 32), dtype=np.float32),
+                policy_letterbox(),
+                force_mosaic=True,
+                enable_mosaic_fallback=False,
+            )
+
+        self.assertTrue(np.all(result[strong_mask] == 1))
+        np.testing.assert_array_equal(result[0, 0], image[0, 0])
+
     def test_configurable_lower_threshold_accepts_weak_target(self):
         gradient = np.linspace(0, 1, 256, dtype=np.float32)
         image = np.repeat(gradient[None, :, None], 256, axis=0)
@@ -529,6 +623,23 @@ class DeevCensorUnitTests(unittest.TestCase):
             np.count_nonzero(np.all(image == 1, axis=2)),
         )
 
+    def test_multiple_stable_tile_hits_use_only_white_without_fallback(self):
+        miss = outputs()
+        hit = outputs(class_id=0, confidence=0.90)
+        session = FakeSession(responses=[miss, hit, hit, miss, miss])
+        image = gradient_image()
+        result = censor._censor_numpy_image(
+            image,
+            runtime(session),
+            enable_tiled_retry=True,
+            enable_mosaic_fallback=False,
+        )
+
+        changed = np.any(result != image, axis=2)
+        self.assertGreater(np.count_nonzero(changed), 0)
+        self.assertTrue(np.all(result[changed] == 1))
+        self.assertEqual(session.call_count, 5)
+
     def test_tile_edge_hit_expands_mosaic_in_global_coordinates(self):
         miss = outputs()
         edge_anus = outputs(
@@ -560,6 +671,27 @@ class DeevCensorUnitTests(unittest.TestCase):
             np.count_nonzero(np.all(result == 1, axis=2)),
             np.count_nonzero(np.all(image == 1, axis=2)),
         )
+
+    def test_tile_edge_hit_is_unchanged_without_mosaic_fallback(self):
+        miss = outputs()
+        edge_anus = outputs(
+            class_id=0,
+            confidence=0.90,
+            box=(1220, 640, 40, 320),
+        )
+        session = FakeSession(
+            responses=[miss, edge_anus, miss, miss, miss],
+        )
+        image = gradient_image()
+        result = censor._censor_numpy_image(
+            image,
+            runtime(session),
+            enable_tiled_retry=True,
+            enable_mosaic_fallback=False,
+        )
+
+        np.testing.assert_array_equal(result, image)
+        self.assertEqual(session.call_count, 5)
 
     def test_single_non_edge_high_confidence_tile_can_use_white(self):
         miss = outputs()
